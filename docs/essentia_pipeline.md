@@ -5,9 +5,11 @@ This pipeline analyzes every audio file downloaded into `C:\Program Files\SpotSe
 ## What it does
 
 - runs Essentia `streaming_extractor_music` on each pending file
-- computes low-level, rhythm, tonal, and optional high-level descriptors
-- keeps the full aggregated descriptor payload
-- omits very heavy outputs such as histograms, covariance matrices, beat position sequences, and chromaprints
+- runs Essentia with aggregated descriptors only (`outputFrames: 0`)
+- computes low-level, rhythm, tonal, and optional high-level descriptors useful for classifying the sound of each track
+- keeps the aggregated descriptor payload in the final sidecar JSON
+- omits beat position sequences, MFCC/GFCC covariance matrices, inverse covariance matrices, and chromaprints
+- uses temporary intermediate files during extraction and deletes them after each track is processed
 - creates a sidecar JSON file next to the output audio file: `<filename>.essentia.json`
 - includes an `xtractor_summary` block that mirrors the main descriptor mapping used by `beets-xtractor`
 
@@ -61,4 +63,6 @@ That sidecar file contains:
 - pipeline metadata
 - source and destination paths
 - `xtractor_summary`
-- the full Essentia aggregated descriptor payload after pruning heavy sections
+- the Essentia aggregated descriptor payload after pruning only the excluded sections listed above
+
+The extractor profile and raw JSON output are created as temporary files during processing and removed once the sidecar has been written successfully.
