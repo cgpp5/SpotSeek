@@ -46,5 +46,30 @@ if errorlevel 1 (
     exit /b 1
 )
 
+REM ------------------------------------------------------------------
+REM Execute Essentia analysis pipeline
+REM ------------------------------------------------------------------
+if "%SPOTSEEK_PENDING_DIR%"=="" set "SPOTSEEK_PENDING_DIR=C:\Program Files\SpotSeek\pending"
+if "%SPOTSEEK_LIBRARY_DIR%"=="" set "SPOTSEEK_LIBRARY_DIR=E:\Music"
+if "%SPOTSEEK_PIPELINE_THREADS%"=="" set "SPOTSEEK_PIPELINE_THREADS=1"
+
+where py >nul 2>nul
+if %errorlevel%==0 (
+    set "PYTHON_CMD=py -3"
+) else (
+    set "PYTHON_CMD=python"
+)
+
+echo Starting Essentia analysis pipeline...
+%PYTHON_CMD% "C:\Program Files\SpotSeek\tools\essentia_pipeline.py" ^
+    --input-dir "%SPOTSEEK_PENDING_DIR%" ^
+    --output-dir "%SPOTSEEK_LIBRARY_DIR%" ^
+    --threads %SPOTSEEK_PIPELINE_THREADS%
+
+if errorlevel 1 (
+    echo ERROR: Essentia pipeline failed.
+    exit /b 1
+)
+
 echo Process completed.
 exit /b 0
