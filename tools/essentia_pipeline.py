@@ -58,8 +58,6 @@ XTRACTOR_TARGETS = {
 
 DEFAULT_PRUNE_RULES = [
     "rhythm.beats_position",
-    "rhythm.bpm_histogram",
-    "tonal.chords_histogram",
     "lowlevel.mfcc.cov",
     "lowlevel.mfcc.icov",
     "lowlevel.gfcc.cov",
@@ -74,7 +72,6 @@ class PipelineConfig:
     output_dir: Path
     extractor_path: Path
     svm_models_dir: Path | None
-    output_cache_dir: Path
     temp_dir: Path
     threads: int
     prune_rules: list[str]
@@ -88,7 +85,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default=r"E:\Music")
     parser.add_argument("--extractor-path", default=os.getenv("ESSENTIA_EXTRACTOR", r"C:\Program Files\SpotSeek\essentia\streaming_extractor_music.exe"))
     parser.add_argument("--svm-models-dir", default=os.getenv("ESSENTIA_SVM_MODELS_DIR"))
-    parser.add_argument("--output-cache-dir", default=os.getenv("ESSENTIA_OUTPUT_CACHE_DIR", r"C:\Program Files\SpotSeek\analysis"))
     parser.add_argument("--temp-dir", default=os.getenv("ESSENTIA_TEMP_DIR", tempfile.gettempdir()))
     parser.add_argument("--threads", type=int, default=int(os.getenv("SPOTSEEK_PIPELINE_THREADS", "1")))
     parser.add_argument("--prune-rule", action="append", dest="prune_rules", default=[])
@@ -104,7 +100,6 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
         output_dir=Path(args.output_dir),
         extractor_path=Path(args.extractor_path),
         svm_models_dir=Path(args.svm_models_dir) if args.svm_models_dir else None,
-        output_cache_dir=Path(args.output_cache_dir),
         temp_dir=Path(args.temp_dir),
         threads=max(1, args.threads),
         prune_rules=prune_rules,
@@ -128,13 +123,16 @@ def main() -> int:
 
     processed = 0
     failed = 0
-    for source_path in pending_files:
-        try:
-            process_file(source_path, config, profile_path)
-            processed += 1
-        except Exception as exc:  # noqa: BLE001
-            failed += 1
-            print(f"ERROR: {source_path} -> {exc}")
+    try:
+        for source_path in pending_files:
+            try:
+                process_file(source_path, config, profile_path)
+                processed += 1
+            except Exception as exc:  # noqa: BLE001
+                failed += 1
+                print(f"ERROR: {source_path} -> {exc}")
+    finally:
+        delete_file(profile_path)
 
     print(f"Pipeline finished. processed={processed} failed={failed}")
     return 1 if failed else 0
@@ -144,7 +142,6 @@ def validate_config(config: PipelineConfig) -> None:
     if not config.input_dir.exists():
         raise FileNotFoundError(f"Input directory not found: {config.input_dir}")
     config.output_dir.mkdir(parents=True, exist_ok=True)
-    config.output_cache_dir.mkdir(parents=True, exist_ok=True)
     config.temp_dir.mkdir(parents=True, exist_ok=True)
 
     if not config.extractor_path.is_file():
@@ -165,7 +162,7 @@ def validate_config(config: PipelineConfig) -> None:
 
 
 def write_extractor_profile(config: PipelineConfig) -> Path:
-    profile_path = config.output_cache_dir / "essentia_profile.yaml"
+    profile_path = config.temp_dir / "spotseek_essentia_profile.yaml"
     svm_model_lines = ""
     if config.svm_models_dir:
         svm_paths = [config.svm_models_dir / name for name in XTRACTOR_MODEL_FILES if (config.svm_models_dir / name).is_file()]
@@ -221,16 +218,19 @@ def process_file(source_path: Path, config: PipelineConfig, profile_path: Path) 
     destination_path = unique_destination(config.output_dir / relative_path)
     destination_path.parent.mkdir(parents=True, exist_ok=True)
 
-    extractor_output_path = config.output_cache_dir / f"{safe_stem(destination_path)}.json"
-    run_essentia_extractor(config.extractor_path, source_path, extractor_output_path, profile_path)
+    extractor_output_path = config.temp_dir / f"spotseek_{safe_stem(destination_path)}.json"
+    try:
+        run_essentia_extractor(config.extractor_path, source_path, extractor_output_path, profile_path)
 
-    raw_descriptors = json.loads(extractor_output_path.read_text(encoding="utf-8"))
-    pruned_descriptors = prune_payload(raw_descriptors, config.prune_rules)
-    xtractor_summary = build_xtractor_summary(raw_descriptors)
+        raw_descriptors = json.loads(extractor_output_path.read_text(encoding="utf-8"))
+        pruned_descriptors = prune_payload(raw_descriptors, config.prune_rules)
+        xtractor_summary = build_xtractor_summary(raw_descriptors)
 
-    shutil.move(str(source_path), str(destination_path))
-    sidecar_path = destination_path.with_name(destination_path.name + ".essentia.json")
-    write_sidecar(sidecar_path, source_path, destination_path, pruned_descriptors, xtractor_summary, config)
+        shutil.move(str(source_path), str(destination_path))
+        sidecar_path = destination_path.with_name(destination_path.name + ".essentia.json")
+        write_sidecar(sidecar_path, source_path, destination_path, pruned_descriptors, xtractor_summary, config)
+    finally:
+        delete_file(extractor_output_path)
 
     delete_if_empty(source_path.parent, stop_at=config.input_dir)
     print(f"Processed {source_path.name} -> {destination_path}")
@@ -304,8 +304,6 @@ def should_prune(dotted_path: str, prune_rules: Iterable[str]) -> bool:
         rule_lower = rule.lower()
         if lowered == rule_lower or lowered.startswith(rule_lower + "."):
             return True
-    if "histogram" in lowered:
-        return True
     if lowered.endswith(".cov") or lowered.endswith(".icov"):
         return True
     return False
@@ -349,6 +347,13 @@ def unique_destination(candidate: Path) -> Path:
         if not alt.exists():
             return alt
         counter += 1
+
+
+def delete_file(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
 
 
 def delete_if_empty(directory: Path, stop_at: Path) -> None:
