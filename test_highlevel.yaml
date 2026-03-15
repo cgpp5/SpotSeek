@@ -1,0 +1,8 @@
+outputFormat: json
+outputFrames: 0
+highlevel:
+  compute: 1
+  svm_models:
+    - C:/Program Files/SpotSeek/essentia/models/danceability.history
+chromaprint:
+  compute: 0
