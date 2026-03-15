@@ -38,7 +38,8 @@ echo Starting download via Soulseek...
     --format flac,aac,m4a,mp3 ^
     --pref-format flac,aac,m4a,mp3 ^
     --min-bitrate 320 ^
-	--concurrent-downloads 10 ^
+	--concurrent-downloads 6 ^
+	--skip-not-found 
 
 if errorlevel 1 (
     echo ERROR: Soulseek download failed.
@@ -51,11 +52,6 @@ REM ------------------------------------------------------------------
 if "%SPOTSEEK_PENDING_DIR%"=="" set "SPOTSEEK_PENDING_DIR=C:\Program Files\SpotSeek\pending"
 if "%SPOTSEEK_LIBRARY_DIR%"=="" set "SPOTSEEK_LIBRARY_DIR=E:\Music"
 if "%SPOTSEEK_PIPELINE_THREADS%"=="" set "SPOTSEEK_PIPELINE_THREADS=1"
-if "%ESSENTIA_SSH_PORT%"=="" set "ESSENTIA_SSH_PORT=22"
-if "%ESSENTIA_SSH_REMOTE_TEMP_DIR%"=="" set "ESSENTIA_SSH_REMOTE_TEMP_DIR=/tmp/spotseek"
-if "%ESSENTIA_SSH_REMOTE_EXTRACTOR%"=="" set "ESSENTIA_SSH_REMOTE_EXTRACTOR=essentia_streaming_extractor_music"
-if "%ESSENTIA_SSH_REMOTE_SVM_MODELS_DIR%"=="" set "ESSENTIA_SSH_REMOTE_SVM_MODELS_DIR=/home/carlos/.local/share/essentia-extractor-svm_models"
-
 
 where py >nul 2>nul
 if %errorlevel%==0 (
@@ -68,15 +64,7 @@ echo Starting Essentia analysis pipeline...
 %PYTHON_CMD% "C:\Program Files\SpotSeek\tools\essentia_pipeline.py" ^
     --input-dir "%SPOTSEEK_PENDING_DIR%" ^
     --output-dir "%SPOTSEEK_LIBRARY_DIR%" ^
-    --threads %SPOTSEEK_PIPELINE_THREADS% ^
-    --ssh-host "%ESSENTIA_SSH_HOST%" ^
-    --ssh-user "%ESSENTIA_SSH_USER%" ^
-    --ssh-port %ESSENTIA_SSH_PORT% ^
-    --ssh-remote-temp-dir "%ESSENTIA_SSH_REMOTE_TEMP_DIR%" ^
-    --ssh-remote-extractor-path "%ESSENTIA_SSH_REMOTE_EXTRACTOR%" ^
-	--ssh-remote-svm-models-dir "%ESSENTIA_SSH_REMOTE_SVM_MODELS_DIR%"
-
-
+    --threads %SPOTSEEK_PIPELINE_THREADS%
 
 if errorlevel 1 (
     echo ERROR: Essentia pipeline failed.

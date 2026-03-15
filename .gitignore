@@ -1,5 +1,6 @@
 # Environment variables
 credentials.env
 pending/
+full-pending/
 export/
 
