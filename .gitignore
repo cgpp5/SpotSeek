@@ -1,5 +1,7 @@
 # Environment variables
 credentials.env
 pending/
-export/
+essentia/
+venv/
+
 

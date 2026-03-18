@@ -1,0 +1,12 @@
+outputFormat: json
+outputFrames: 0
+highlevel:
+  compute: 1
+  svm_models:
+    - C:/Program Files/SpotSeek/essentia/models/danceability.history
+    - C:/Program Files/SpotSeek/essentia/models/mood_happy.history
+    - C:/Program Files/SpotSeek/essentia/models/mood_sad.history
+    - C:/Program Files/SpotSeek/essentia/models/genre_electronic.history
+    - C:/Program Files/SpotSeek/essentia/models/voice_instrumental.history    
+chromaprint:
+  compute: 0

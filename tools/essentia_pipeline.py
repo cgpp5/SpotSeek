@@ -3,483 +3,496 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass
+import numpy as np
+import librosa
+import onnxruntime as ort
 from pathlib import Path
-from typing import Any, Iterable
 
 AUDIO_EXTENSIONS = {".mp3", ".flac", ".m4a", ".wav", ".ogg", ".aac", ".wma", ".opus", ".aiff", ".aif", ".wv"}
 
-XTRACTOR_MODEL_FILES = [
-    "danceability.history",
-    "gender.history",
-    "genre_rosamerica.history",
-    "mood_acoustic.history",
-    "mood_aggressive.history",
-    "mood_electronic.history",
-    "mood_happy.history",
-    "mood_sad.history",
-    "mood_party.history",
-    "mood_relaxed.history",
-    "voice_instrumental.history",
-    "moods_mirex.history",
-]
-
-XTRACTOR_TARGETS = {
-    "bpm": ("rhythm.bpm", "integer"),
-    "danceability": ("rhythm.danceability", "float"),
-    "beats_count": ("rhythm.beats_count", "integer"),
-    "average_loudness": ("lowlevel.average_loudness", "float"),
-    "danceable": ("highlevel.danceability.all.danceable", "float"),
-    "gender": ("highlevel.gender.value", "string"),
-    "is_male": ("highlevel.gender.all.male", "float"),
-    "is_female": ("highlevel.gender.all.female", "float"),
-    "genre_rosamerica": ("highlevel.genre_rosamerica.value", "string"),
-    "voice_instrumental": ("highlevel.voice_instrumental.value", "string"),
-    "is_voice": ("highlevel.voice_instrumental.all.voice", "float"),
-    "is_instrumental": ("highlevel.voice_instrumental.all.instrumental", "float"),
-    "mood_acoustic": ("highlevel.mood_acoustic.all.acoustic", "float"),
-    "mood_aggressive": ("highlevel.mood_aggressive.all.aggressive", "float"),
-    "mood_electronic": ("highlevel.mood_electronic.all.electronic", "float"),
-    "mood_happy": ("highlevel.mood_happy.all.happy", "float"),
-    "mood_sad": ("highlevel.mood_sad.all.sad", "float"),
-    "mood_party": ("highlevel.mood_party.all.party", "float"),
-    "mood_relaxed": ("highlevel.mood_relaxed.all.relaxed", "float"),
-    "mood_mirex": ("highlevel.moods_mirex.value", "string"),
-    "mood_mirex_cluster_1": ("highlevel.moods_mirex.all.Cluster1", "float"),
-    "mood_mirex_cluster_2": ("highlevel.moods_mirex.all.Cluster2", "float"),
-    "mood_mirex_cluster_3": ("highlevel.moods_mirex.all.Cluster3", "float"),
-    "mood_mirex_cluster_4": ("highlevel.moods_mirex.all.Cluster4", "float"),
-    "mood_mirex_cluster_5": ("highlevel.moods_mirex.all.Cluster5", "float"),
-}
-
-DEFAULT_PRUNE_RULES = [
-    "rhythm.beats_position",
-    "lowlevel.mfcc.cov",
-    "lowlevel.mfcc.icov",
-    "lowlevel.gfcc.cov",
-    "lowlevel.gfcc.icov",
-    "chromaprint",
-]
-
-@dataclass
-class PipelineConfig:
-    input_dir: Path
-    output_dir: Path
-    extractor_path: Path
-    svm_models_dir: Path | None
-    ssh_remote_svm_models_dir: str | None
-    temp_dir: Path
-    threads: int
-    prune_rules: list[str]
-    profile_stats: list[str]
-    fail_on_missing_models: bool
-    ssh_host: str | None
-    ssh_user: str | None
-    ssh_port: int
-    ssh_remote_temp_dir: str
-    ssh_remote_extractor_path: str
-
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Analyze SpotSeek downloads with Essentia and move them into the library.")
+    parser = argparse.ArgumentParser(description="Análisis avanzado con Essentia (TensorFlow + SVM).")
     parser.add_argument("--input-dir", default=r"C:\Program Files\SpotSeek\pending")
     parser.add_argument("--output-dir", default=r"E:\Music")
-    parser.add_argument("--extractor-path", default=os.getenv("ESSENTIA_EXTRACTOR", r"C:\Program Files\SpotSeek\essentia\streaming_extractor_music.exe"))
-    parser.add_argument("--svm-models-dir", default=os.getenv("ESSENTIA_SVM_MODELS_DIR"))
-    parser.add_argument("--temp-dir", default=os.getenv("ESSENTIA_TEMP_DIR", tempfile.gettempdir()))
-    parser.add_argument("--threads", type=int, default=int(os.getenv("SPOTSEEK_PIPELINE_THREADS", "1")))
-    parser.add_argument("--prune-rule", action="append", dest="prune_rules", default=[])
-    parser.add_argument("--profile-stats", nargs="+", default=["mean", "var", "median", "min", "max"])
-    parser.add_argument("--allow-missing-models", action="store_true")
-    parser.add_argument("--ssh-host", default=os.getenv("ESSENTIA_SSH_HOST"))
-    parser.add_argument("--ssh-user", default=os.getenv("ESSENTIA_SSH_USER"))
-    parser.add_argument("--ssh-port", type=int, default=int(os.getenv("ESSENTIA_SSH_PORT", "22")))
-    parser.add_argument("--ssh-remote-temp-dir", default=os.getenv("ESSENTIA_SSH_REMOTE_TEMP_DIR", "/tmp/spotseek"))
-    parser.add_argument(
-        "--ssh-remote-extractor-path",
-        default=os.getenv("ESSENTIA_SSH_REMOTE_EXTRACTOR", "essentia_streaming_extractor_music"),
-    )
-    parser.add_argument(
-        "--ssh-remote-svm-models-dir",
-        default=os.getenv("ESSENTIA_SSH_REMOTE_SVM_MODELS_DIR"),
-    )
-
+    parser.add_argument("--essentia-dir", default=r"C:\Program Files\SpotSeek\essentia")
+    parser.add_argument("--threads", type=int, default=1)
     return parser.parse_args()
 
-def build_config(args: argparse.Namespace) -> PipelineConfig:
-    prune_rules = DEFAULT_PRUNE_RULES + list(args.prune_rules or [])
-    return PipelineConfig(
-        input_dir=Path(args.input_dir),
-        output_dir=Path(args.output_dir),
-        extractor_path=Path(args.extractor_path),
-        svm_models_dir=Path(args.svm_models_dir) if args.svm_models_dir else None,
-        temp_dir=Path(args.temp_dir),
-        threads=max(1, args.threads),
-        prune_rules=prune_rules,
-        profile_stats=args.profile_stats,
-        fail_on_missing_models=not args.allow_missing_models,
-        ssh_host=args.ssh_host,
-        ssh_user=args.ssh_user,
-        ssh_port=max(1, args.ssh_port),
-        ssh_remote_temp_dir=args.ssh_remote_temp_dir,
-        ssh_remote_extractor_path=args.ssh_remote_extractor_path,
-        ssh_remote_svm_models_dir=args.ssh_remote_svm_models_dir,
+def create_extractor_profile(temp_dir: Path, essentia_dir: Path) -> Path:
+    """Crea el perfil YAML activando SVM pero desactivando cálculos redundantes."""
+    profile_path = temp_dir / "profile.yaml"
+    svm_models_dir = essentia_dir / "models" / "svm"
+    
+    svm_models = []
+    if svm_models_dir.exists():
+        svm_models = [str(p.as_posix()) for p in svm_models_dir.glob("*.history")]
 
-    )
+    svm_config = "compute: 0"
+    if svm_models:
+        models_yaml = "\n".join(f"    - {m}" for m in svm_models)
+        svm_config = f"compute: 1\n  svm_models:\n{models_yaml}"
 
-
-def main() -> int:
-    args = parse_args()
-    config = build_config(args)
-    validate_config(config)
-
-    pending_files = sorted(path for path in config.input_dir.rglob("*") if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS)
-    if not pending_files:
-        print(f"No supported audio files found in {config.input_dir}")
-        return 0
-
-    print(f"Found {len(pending_files)} pending file(s) in {config.input_dir}")
-    profile_path = write_extractor_profile(config)
-
-    processed = 0
-    failed = 0
-    try:
-        for source_path in pending_files:
-            try:
-                process_file(source_path, config, profile_path)
-                processed += 1
-            except Exception as exc:  # noqa: BLE001
-                failed += 1
-                print(f"ERROR: {source_path} -> {exc}")
-    finally:
-        delete_file(profile_path)
-
-    print(f"Pipeline finished. processed={processed} failed={failed}")
-    return 1 if failed else 0
-
-
-def validate_config(config: PipelineConfig) -> None:
-    if not config.input_dir.exists():
-        raise FileNotFoundError(f"Input directory not found: {config.input_dir}")
-    config.output_dir.mkdir(parents=True, exist_ok=True)
-    config.temp_dir.mkdir(parents=True, exist_ok=True)
-
-    if not config.ssh_host:
-        if not config.extractor_path.is_file():
-            raise FileNotFoundError(
-                "Essentia extractor not found. Set ESSENTIA_EXTRACTOR or pass --extractor-path. "
-                f"Current value: {config.extractor_path}"
-            )
-
-
-    if config.svm_models_dir and not config.svm_models_dir.is_dir():
-        raise FileNotFoundError(f"SVM models directory not found: {config.svm_models_dir}")
-
-    if config.svm_models_dir:
-        missing_models = [name for name in XTRACTOR_MODEL_FILES if not (config.svm_models_dir / name).is_file()]
-        if missing_models and config.fail_on_missing_models:
-            raise FileNotFoundError(
-                "Missing SVM models required for xtractor-compatible high-level descriptors: " + ", ".join(missing_models)
-            )
-
-def write_extractor_profile(config: PipelineConfig) -> Path:
-    profile_path = config.temp_dir / "spotseek_essentia_profile.yaml"
-
-    svm_model_lines = ""
-    if config.ssh_host:
-        if config.ssh_remote_svm_models_dir:
-            remote_base = config.ssh_remote_svm_models_dir.rstrip("/")
-            svm_model_lines = "\n".join(
-                f"      - {remote_base}/{name}" for name in XTRACTOR_MODEL_FILES
-            )
-    else:
-        if config.svm_models_dir:
-            svm_paths = [
-                config.svm_models_dir / name
-                for name in XTRACTOR_MODEL_FILES
-                if (config.svm_models_dir / name).is_file()
-            ]
-            if svm_paths:
-                svm_model_lines = "\n".join(
-                    f"      - {to_posix_path(path)}" for path in svm_paths
-                )
-
-    highlevel_compute = 1 if svm_model_lines else 0
-
-    profile = f"""outputFormat: json
+    profile_content = f"""outputFormat: json
 outputFrames: 0
-requireMbid: false
-indent: 2
-analysisSampleRate: 44100.0
-
 highlevel:
-  compute: {highlevel_compute}"""
-    if svm_model_lines:
-        profile += f"\n  svm_models:\n{svm_model_lines}\n"
-    else:
-        profile += "\n"
-
-    profile += """
+  {svm_config}
 chromaprint:
   compute: 0
 """
-    profile_path.write_text(profile, encoding="utf-8")
+    profile_path.write_text(profile_content, encoding="utf-8")
     return profile_path
 
-def process_file(source_path: Path, config: PipelineConfig, profile_path: Path) -> None:
-    relative_path = source_path.relative_to(config.input_dir)
-    destination_path = unique_destination(config.output_dir / relative_path)
-    destination_path.parent.mkdir(parents=True, exist_ok=True)
+def run_subprocess(cmd: list[str]) -> bool:
+    import os
+    import subprocess
+    import ctypes
+    from pathlib import Path
 
-    extractor_output_path = config.temp_dir / f"spotseek_{safe_stem(destination_path)}.json"
+    # --- AFINIDAD: cores 0–7 (P-cores típicos en i5-13600KF) ---
+    P_CORE_MASK = 0xFF
+
+    env = os.environ.copy()
+    env["TF_CPP_MIN_LOG_LEVEL"] = "3"
+    env["TF_ENABLE_ONEDNN_OPTS"] = "0"
+
     try:
-        run_essentia_extractor(config, source_path, extractor_output_path, profile_path)
-
-        raw_descriptors = json.loads(extractor_output_path.read_text(encoding="utf-8"))
-        pruned_descriptors = prune_payload(raw_descriptors, config.prune_rules)
-        xtractor_summary = build_xtractor_summary(raw_descriptors)
-
-        shutil.move(str(source_path), str(destination_path))
-        sidecar_path = destination_path.with_name(destination_path.name + ".essentia.json")
-        write_sidecar(sidecar_path, source_path, destination_path, pruned_descriptors, xtractor_summary, config)
-    finally:
-        delete_file(extractor_output_path)
-
-    delete_if_empty(source_path.parent, stop_at=config.input_dir)
-    print(f"Processed {source_path.name} -> {destination_path}")
-
-def run_essentia_extractor(config: PipelineConfig, input_path: Path, output_path: Path, profile_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if config.ssh_host:
-        run_remote_essentia_extractor(config, input_path, output_path, profile_path)
-        return
-
-    command = [str(config.extractor_path), str(input_path), str(output_path), str(profile_path)]
-    completed = subprocess.run(command, capture_output=True, text=True, check=False)
-    if completed.returncode != 0:
-        raise RuntimeError(
-            "Essentia extraction failed with code "
-            f"{completed.returncode}. stdout={completed.stdout.strip()} stderr={completed.stderr.strip()}"
-        )
-    if not output_path.is_file():
-        raise FileNotFoundError(f"Expected Essentia output file was not created: {output_path}")
-
-
-def run_remote_essentia_extractor(
-    config: PipelineConfig,
-    input_path: Path,
-    output_path: Path,
-    profile_path: Path,
-) -> None:
-    if not config.ssh_user:
-        raise ValueError("ESSENTIA_SSH_USER is required when ESSENTIA_SSH_HOST is set")
-
-    remote = f"{config.ssh_user}@{config.ssh_host}"
-    remote_base = config.ssh_remote_temp_dir.rstrip("/")
-    remote_stem = safe_stem(input_path)
-    remote_input = f"{remote_base}/{remote_stem}{input_path.suffix.lower()}"
-    remote_profile = f"{remote_base}/{remote_stem}.yaml"
-    remote_output = f"{remote_base}/{remote_stem}.json"
-
-    ssh_base = ["ssh", "-p", str(config.ssh_port), remote]
-    scp_base = ["scp", "-P", str(config.ssh_port)]
-
-    mkdir_cmd = ssh_base + [f"mkdir -p '{remote_base}'"]
-    completed = subprocess.run(mkdir_cmd, capture_output=True, text=True, check=False)
-    if completed.returncode != 0:
-        raise RuntimeError(
-            "SSH remote directory creation failed with code "
-            f"{completed.returncode}. stdout={completed.stdout.strip()} stderr={completed.stderr.strip()}"
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env
         )
 
-    upload_audio = scp_base + [str(input_path), f"{remote}:{remote_input}"]
-    completed = subprocess.run(upload_audio, capture_output=True, text=True, check=False)
-    if completed.returncode != 0:
-        raise RuntimeError(
-            "SCP audio upload failed with code "
-            f"{completed.returncode}. stdout={completed.stdout.strip()} stderr={completed.stderr.strip()}"
-        )
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
-    upload_profile = scp_base + [str(profile_path), f"{remote}:{remote_profile}"]
-    completed = subprocess.run(upload_profile, capture_output=True, text=True, check=False)
-    if completed.returncode != 0:
-        raise RuntimeError(
-            "SCP profile upload failed with code "
-            f"{completed.returncode}. stdout={completed.stdout.strip()} stderr={completed.stderr.strip()}"
-        )
+        # Forzar afinidad inmediatamente
+        if not kernel32.SetProcessAffinityMask(proc._handle, P_CORE_MASK):
+            raise ctypes.WinError(ctypes.get_last_error())
 
-    remote_examples_dir = Path(config.ssh_remote_extractor_path).parent
-    remote_lib_dir = remote_examples_dir.parent.as_posix()
+        stdout, stderr = proc.communicate()
 
-    remote_command = (
-        f"export LD_LIBRARY_PATH='{remote_lib_dir}':$LD_LIBRARY_PATH && "
-        f"'{config.ssh_remote_extractor_path}' "
-        f"'{remote_input}' "
-        f"'{remote_output}' "
-        f"'{remote_profile}'"
+        if proc.returncode != 0:
+            print(f"Fallo en: {Path(cmd[0]).name} con el modelo {Path(cmd[3]).name}")
+            if stdout.strip():
+                print(f"  -> STDOUT: {stdout.strip()}")
+            if stderr.strip():
+                print(f"  -> STDERR: {stderr.strip()}")
+            return False
+
+        return True
+
+    except Exception as e:
+        print(f"Excepción crítica:\n{e}")
+        return False
+
+def merge_jsons(json_results: dict[str, Path], output_path: Path, semantic_data: dict | None = None):
+    """Combina la salida de todas las redes neuronales y del extractor base."""
+    merged_data = {"neural_networks": {}}
+    
+    for key, p in json_results.items():
+        if not p.exists():
+            continue
+        with open(p, "r", encoding="utf-8") as f:
+            try:
+                data = json.load(f)
+                if key == "base":
+                    merged_data.update(data)
+                elif key == "tempo":
+                    # Reemplazar el BPM clásico por el de la red neuronal (TempoCNN)
+                    if "global_bpm" in data and "rhythm" in merged_data:
+                        merged_data["rhythm"]["bpm"] = data["global_bpm"]
+                else:
+                    merged_data["neural_networks"][key] = data
+            except json.JSONDecodeError:
+                pass
+                
+    if semantic_data:
+        merged_data["semantic"] = semantic_data
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(merged_data, f, indent=4)
+
+def run_onnx_model(audio_path: Path, model_path: Path, metadata_path: Path, out_json: Path):
+    with open(metadata_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    sr = meta.get("sample_rate", 16000)
+    duration = meta.get("duration", None)
+
+    y, _ = librosa.load(audio_path, sr=sr, mono=True)
+
+    if duration:
+        target_len = int(duration * sr)
+        if len(y) < target_len:
+            y = np.pad(y, (0, target_len - len(y)))
+        else:
+            y = y[:target_len]
+
+    mel = librosa.feature.melspectrogram(
+        y=y,
+        sr=sr,
+        n_fft=1024,
+        hop_length=256,
+        n_mels=meta.get("n_mels", 96),
+        fmin=0,
+        fmax=sr // 2,
     )
 
-    completed = subprocess.run(ssh_base + [remote_command], capture_output=True, text=True, check=False)
-    if completed.returncode != 0:
-        raise RuntimeError(
-            "Remote Essentia extraction failed with code "
-            f"{completed.returncode}. stdout={completed.stdout.strip()} stderr={completed.stderr.strip()}"
+    logmel = librosa.power_to_db(mel, ref=np.max)
+    logmel = (logmel - logmel.mean()) / (logmel.std() + 1e-8)
+
+    x = logmel.T[np.newaxis, :, :].astype(np.float32)
+
+    sess = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+    input_name = sess.get_inputs()[0].name
+    output_name = sess.get_outputs()[0].name
+
+    out = sess.run([output_name], {input_name: x})[0]
+
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(out.tolist(), f)
+
+def run_effnet_track_embeddings(audio_path: Path, model_path: Path, meta_path: Path, out_json: Path):
+    import numpy as np
+    import librosa
+    import onnxruntime as ort
+    import json
+
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    sr = meta.get("sample_rate", 16000)
+
+    y, _ = librosa.load(audio_path, sr=sr, mono=True)
+
+    PATCHES = 64
+    PATCH_DURATION = 1.0
+    PATCH_SAMPLES = int(PATCH_DURATION * sr)
+
+    if len(y) < PATCHES * PATCH_SAMPLES:
+        y = np.pad(y, (0, PATCHES * PATCH_SAMPLES - len(y)))
+
+    patches = []
+    for i in range(PATCHES):
+        start = i * PATCH_SAMPLES
+        end = start + PATCH_SAMPLES
+        patches.append(y[start:end])
+
+    patches = np.stack(patches)
+
+    mels = []
+
+    for p in patches:
+        mel = librosa.feature.melspectrogram(
+            y=p,
+            sr=sr,
+            n_fft=1024,
+            hop_length=256,
+            n_mels=96,
+            fmin=0,
+            fmax=sr // 2,
         )
 
-    download_output = scp_base + [f"{remote}:{remote_output}", str(output_path)]
-    completed = subprocess.run(download_output, capture_output=True, text=True, check=False)
-    if completed.returncode != 0:
-        raise RuntimeError(
-            "SCP JSON download failed with code "
-            f"{completed.returncode}. stdout={completed.stdout.strip()} stderr={completed.stderr.strip()}"
-        )
+        logmel = librosa.power_to_db(mel, ref=np.max)
+        logmel = (logmel - logmel.mean()) / (logmel.std() + 1e-8)
 
-    cleanup_command = f"rm -f '{remote_input}' '{remote_profile}' '{remote_output}'"
-    subprocess.run(ssh_base + [cleanup_command], capture_output=True, text=True, check=False)
-
-    if not output_path.is_file():
-        raise FileNotFoundError(f"Expected remote Essentia output file was not downloaded: {output_path}")
-
-
-def write_sidecar(
-    sidecar_path: Path,
-    source_path: Path,
-    destination_path: Path,
-    descriptors: dict[str, Any],
-    xtractor_summary: dict[str, Any],
-    config: PipelineConfig,
-) -> None:
-    payload = {
-        "pipeline": {
-            "name": "spotseek-essentia-pipeline",
-            "version": 1,
-            "input_dir": str(config.input_dir),
-            "output_dir": str(config.output_dir),
-            "extractor_path": str(config.extractor_path),
-            "svm_models_dir": str(config.svm_models_dir) if config.svm_models_dir else None,
-            "prune_rules": config.prune_rules,
-            "profile_stats": config.profile_stats,
-        },
-        "files": {
-            "source_path": str(source_path),
-            "output_path": str(destination_path),
-            "sidecar_path": str(sidecar_path),
-        },
-        "xtractor_summary": xtractor_summary,
-        "descriptors": descriptors,
-    }
-    sidecar_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-
-
-def prune_payload(payload: Any, prune_rules: Iterable[str], path: tuple[str, ...] = ()) -> Any:
-    dotted_path = ".".join(path)
-    if dotted_path and should_prune(dotted_path, prune_rules):
-        return None
-
-    if isinstance(payload, dict):
-        result = {}
-        for key, value in payload.items():
-            child = prune_payload(value, prune_rules, path + (key,))
-            if child is not None:
-                result[key] = child
-        return result
-
-    if isinstance(payload, list):
-        return [prune_payload(value, prune_rules, path) if isinstance(value, (dict, list)) else value for value in payload]
-
-    return payload
-
-
-def should_prune(dotted_path: str, prune_rules: Iterable[str]) -> bool:
-    lowered = dotted_path.lower()
-    for rule in prune_rules:
-        rule_lower = rule.lower()
-        if lowered == rule_lower or lowered.startswith(rule_lower + "."):
-            return True
-    if lowered.endswith(".cov") or lowered.endswith(".icov"):
-        return True
-    return False
-
-
-def build_xtractor_summary(payload: dict[str, Any]) -> dict[str, Any]:
-    summary: dict[str, Any] = {}
-    for field, (path, value_type) in XTRACTOR_TARGETS.items():
-        value = extract_value(payload, path)
-        if value is None:
-            continue
-        if value_type == "integer":
-            summary[field] = int(round(float(value)))
-        elif value_type == "float":
-            summary[field] = float(value)
-        elif value_type == "string":
-            summary[field] = str(value)
+        if logmel.shape[1] < 128:
+            logmel = np.pad(logmel, ((0, 0), (0, 128 - logmel.shape[1])))
         else:
-            summary[field] = value
-    return summary
+            logmel = logmel[:, :128]
+
+        mels.append(logmel.T)
+
+    x = np.stack(mels).astype(np.float32)
+
+    sess = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+    input_name = sess.get_inputs()[0].name
+    output_name = sess.get_outputs()[0].name
+
+    out = sess.run([output_name], {input_name: x})[0]
+
+    embedding = out.mean(axis=0)
+
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(embedding.tolist(), f)
+
+def run_openl3_embeddings(audio_path: Path, model_path: Path, meta_path: Path, out_json: Path):
+    import numpy as np
+    import librosa
+    import onnxruntime as ort
+    import json
+
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    sr = meta.get("sample_rate", 48000)
+
+    y, _ = librosa.load(audio_path, sr=sr, mono=True)
+
+    # OpenL3 usa ventanas de 1s con hop de 0.5s
+    WINDOW_SEC = 1.0
+    HOP_SEC = 0.5
+
+    win_samples = int(WINDOW_SEC * sr)
+    hop_samples = int(HOP_SEC * sr)
+
+    frames = []
+    for start in range(0, len(y) - win_samples + 1, hop_samples):
+        frames.append(y[start:start + win_samples])
+
+    if not frames:
+        frames.append(np.pad(y, (0, win_samples - len(y))))
+
+    mels = []
+
+    for frame in frames:
+        mel = librosa.feature.melspectrogram(
+            y=frame,
+            sr=sr,
+            n_fft=2048,
+            hop_length=512,
+            n_mels=199,
+            fmin=0,
+            fmax=sr // 2,
+        )
+
+        logmel = librosa.power_to_db(mel, ref=np.max)
+        logmel = (logmel - logmel.mean()) / (logmel.std() + 1e-8)
+
+        # Forzar exactamente 256 frames (eje tiempo = axis 1)
+        if logmel.shape[1] < 256:
+            logmel = np.pad(logmel, ((0, 0), (0, 256 - logmel.shape[1])))
+        else:
+            logmel = logmel[:, :256]
+
+        mels.append(logmel.T)
+
+    sess = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+    input_name = sess.get_inputs()[0].name
+    output_name = sess.get_outputs()[0].name
+
+    BATCH_SIZE = 8
+    embeddings = []
+
+    for i in range(0, len(mels), BATCH_SIZE):
+        batch = mels[i:i + BATCH_SIZE]
+        x = np.stack(batch)[..., np.newaxis].astype(np.float32)
+        out = sess.run([output_name], {input_name: x})[0]
+        embeddings.append(out)
+
+    embedding = np.concatenate(embeddings, axis=0).mean(axis=0)
 
 
-def extract_value(payload: dict[str, Any], dotted_path: str) -> Any:
-    current: Any = payload
-    for part in dotted_path.split("."):
-        if not isinstance(current, dict) or part not in current:
-            return None
-        current = current[part]
-    return current
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(embedding.tolist(), f)
 
+def run_maest_30s_519(audio_path: Path, model_path: Path, meta_path: Path, out_json: Path):
+    import numpy as np
+    import librosa
+    import onnxruntime as ort
+    import json
 
-def unique_destination(candidate: Path) -> Path:
-    if not candidate.exists():
-        return candidate
-    stem = candidate.stem
-    suffix = candidate.suffix
-    parent = candidate.parent
-    counter = 1
-    while True:
-        alt = parent / f"{stem} ({counter}){suffix}"
-        if not alt.exists():
-            return alt
-        counter += 1
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
 
+    sr = meta.get("sample_rate", 16000)
 
-def delete_file(path: Path) -> None:
-    try:
-        path.unlink()
-    except FileNotFoundError:
+    # MAEST 30s: audio fijo 30 segundos
+    DURATION_SEC = 30.0
+    target_len = int(DURATION_SEC * sr)
+
+    y, _ = librosa.load(audio_path, sr=sr, mono=True)
+
+    if len(y) < target_len:
+        y = np.pad(y, (0, target_len - len(y)))
+    else:
+        y = y[:target_len]
+
+    # MAEST: mel 96, hop 256, n_fft 1024 -> frames esperados ~1876
+    mel = librosa.feature.melspectrogram(
+        y=y,
+        sr=sr,
+        n_fft=1024,
+        hop_length=256,
+        n_mels=96,
+        fmin=0,
+        fmax=sr // 2,
+        power=2.0,
+    )
+
+    logmel = librosa.power_to_db(mel, ref=np.max)
+    logmel = (logmel - logmel.mean()) / (logmel.std() + 1e-8)
+
+    # Forzar exactamente 1876 frames (eje tiempo = axis 1)
+    EXPECTED_FRAMES = 1876
+    if logmel.shape[1] < EXPECTED_FRAMES:
+        logmel = np.pad(logmel, ((0, 0), (0, EXPECTED_FRAMES - logmel.shape[1])))
+    else:
+        logmel = logmel[:, :EXPECTED_FRAMES]
+
+    # (batch, frames, mels, channel)
+    x = logmel.T[np.newaxis, ...].astype(np.float32)
+
+    sess = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+    input_name = sess.get_inputs()[0].name
+    output_name = sess.get_outputs()[0].name
+
+    out = sess.run([output_name], {input_name: x})[0]
+
+    # salida típica: (1, 519)
+    scores = np.squeeze(out).tolist()
+
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(scores, f)
+
+def map_maest_labels(scores: list[float], classes: list[str], threshold=0.2, top_n=20):
+    pairs = list(zip(classes, scores))
+    pairs.sort(key=lambda x: x[1], reverse=True)
+
+    top = pairs[:top_n]
+    filtered = [p for p in pairs if p[1] >= threshold]
+
+    genres = set()
+    styles = set()
+
+    for label, score in filtered:
+        if "---" in label:
+            genre, style = label.split("---", 1)
+            genres.add(genre)
+            styles.add(style)
+
+    return {
+        "top_labels": [{"label": l, "score": float(s)} for l, s in top],
+        "genres": sorted(genres),
+        "styles": sorted(styles),
+    }
+
+def process_file(audio_path: Path, args: argparse.Namespace):
+    essentia_dir = Path(args.essentia_dir)
+    temp_dir = Path(tempfile.gettempdir()) / "spotseek_analysis"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    
+    base_name = audio_path.stem
+    json_results: dict[str, Path] = {}
+    semantic_data = {}
+    
+    print(f"  -> Extrayendo características base y SVM...")
+    extractor_exe = essentia_dir / "streaming_extractor_music.exe"
+    profile_yaml = create_extractor_profile(temp_dir, essentia_dir)
+    base_json = temp_dir / f"{base_name}_base.json"
+    
+    if extractor_exe.exists() and run_subprocess([str(extractor_exe), str(audio_path), str(base_json), str(profile_yaml)]):
+        json_results["base"] = base_json
+
+    print(f"  -> Extrayendo BPM (TempoCNN)...")
+    tempocnn_exe = essentia_dir / "standard_tempocnn.exe"
+    tempocnn_model = essentia_dir / "models" / "tempocnn" / "deeptemp-k16-3.pb"
+    if tempocnn_exe.exists() and tempocnn_model.exists():
+        tempo_json = temp_dir / f"{base_name}_tempo.json"
+        if run_subprocess([str(tempocnn_exe), str(audio_path), str(tempo_json), str(tempocnn_model)]):
+            json_results["tempo"] = tempo_json
+
+    print(f"  -> Evaluando modelos MusiCNN...")
+    musicnn_exe = essentia_dir / "streaming_musicnn_predict.exe"
+    musicnn_dir = essentia_dir / "models" / "musicnn"
+    if musicnn_exe.exists() and musicnn_dir.exists():
+        for pb_file in musicnn_dir.glob("*.pb"):
+            out_json = temp_dir / f"{base_name}_{pb_file.stem}.json"
+            if run_subprocess([str(musicnn_exe), str(audio_path), str(out_json), str(pb_file)]):
+                json_results[pb_file.stem] = out_json
+            
+    print(f"  -> Evaluando modelos VGGish...")
+    vggish_exe = essentia_dir / "streaming_vggish_predict.exe"
+    vggish_dir = essentia_dir / "models" / "vggish"
+    if vggish_exe.exists() and vggish_dir.exists():
+        for pb_file in vggish_dir.glob("*.pb"):
+            out_json = temp_dir / f"{base_name}_{pb_file.stem}.json"
+            if run_subprocess([str(vggish_exe), str(audio_path), str(out_json), str(pb_file)]):
+                json_results[pb_file.stem] = out_json
+    
+    print(f"  -> Evaluando EffNet track embeddings (ONNX)...")
+
+    effnet_model = essentia_dir / "models" / "discogs_track_embeddings-effnet-bs64-1.onnx"
+    effnet_meta = essentia_dir / "models" / "discogs_track_embeddings-effnet-bs64-1.json"
+    effnet_out = temp_dir / f"{base_name}_effnet_track.json"
+
+    if effnet_model.exists() and effnet_meta.exists():
+        try:
+            run_effnet_track_embeddings(audio_path, effnet_model, effnet_meta, effnet_out)
+            json_results["effnet_track"] = effnet_out
+        except Exception as e:
+            print(f"    Fallo EffNet ONNX: {e}")
+
+    print(f"  -> Evaluando OpenL3 music embeddings (ONNX)...")
+
+    openl3_model = essentia_dir / "models" / "openl3-music-mel256-emb512-3.onnx"
+    openl3_meta = essentia_dir / "models" / "openl3-music-mel256-emb512-3.json"
+    openl3_out = temp_dir / f"{base_name}_openl3_music.json"
+
+    if openl3_model.exists() and openl3_meta.exists():
+        try:
+            run_openl3_embeddings(audio_path, openl3_model, openl3_meta, openl3_out)
+            json_results["openl3_music"] = openl3_out
+        except Exception as e:
+            print(f"    Fallo OpenL3 ONNX: {e}")
+
+    print(f"  -> Evaluando MAEST 30s 519L (ONNX)...")
+
+    maest_model = essentia_dir / "models" / "discogs-maest-30s-pw-519l-2.onnx"
+    maest_meta = essentia_dir / "models" / "discogs-maest-30s-pw-519l-2.json"
+    maest_out = temp_dir / f"{base_name}_maest_519.json"
+
+    if maest_model.exists() and maest_meta.exists():
+        try:
+            run_maest_30s_519(audio_path, maest_model, maest_meta, maest_out)
+            json_results["maest_519"] = maest_out
+        except Exception as e:
+            print(f"    Fallo MAEST ONNX: {e}")
+
+    with open(maest_meta, "r", encoding="utf-8") as f:
+        maest_info = json.load(f)
+
+    with open(maest_out, "r", encoding="utf-8") as f:
+        scores = json.load(f)
+
+    semantic = map_maest_labels(scores, maest_info["classes"])
+    semantic_data["maest"] = semantic
+    print(f"  -> Consolidando datos y moviendo a biblioteca...")
+    merged_json_path = temp_dir / f"{base_name}_merged.json"
+    merge_jsons(json_results, merged_json_path, semantic_data)
+    
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    
+    shutil.move(str(merged_json_path), str(out_dir / f"{base_name}.json"))
+    shutil.move(str(audio_path), str(out_dir / audio_path.name))
+    
+    for f in json_results.values():
+        if f.exists():
+            f.unlink()
+    if profile_yaml.exists():
+        profile_yaml.unlink()
+
+def main():
+    args = parse_args()
+    input_dir = Path(args.input_dir)
+    
+    if not input_dir.exists():
+        print(f"El directorio {input_dir} no existe.")
         return
 
-
-def delete_if_empty(directory: Path, stop_at: Path) -> None:
-    current = directory
-    stop_at_resolved = stop_at.resolve()
-    while True:
-        try:
-            current_resolved = current.resolve()
-        except FileNotFoundError:
-            return
-        if current_resolved == stop_at_resolved:
-            return
-        try:
-            current.rmdir()
-        except OSError:
-            return
-        current = current.parent
-
-
-def safe_stem(path: Path) -> str:
-    return "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in path.stem)
-
-
-def to_posix_path(path: Path) -> str:
-    return path.as_posix()
-
+    pending_files = [p for p in input_dir.rglob("*") if p.suffix.lower() in AUDIO_EXTENSIONS]
+    print(f"Encontrados {len(pending_files)} archivos pendientes en {input_dir}")
+    
+    for audio_file in pending_files:
+        print(f"\nProcesando: {audio_file.name}")
+        process_file(audio_file, args)
+        
+    print("\nPipeline finalizado.")
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except Exception as exc:  # noqa: BLE001
-        print(f"FATAL: {exc}")
-        raise SystemExit(1)
+    main()
