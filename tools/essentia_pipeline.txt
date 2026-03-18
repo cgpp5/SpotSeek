@@ -338,7 +338,10 @@ def run_maest_30s_519(audio_path: Path, model_path: Path, meta_path: Path, out_j
     x = logmel.T[np.newaxis, ...].astype(np.float32)
 
     sess = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
-    
+    print("MAEST outputs:")
+    for i, o in enumerate(sess.get_outputs()):
+        print(i, o.name, o.shape, o.type)
+
     input_name = sess.get_inputs()[0].name
 
     # Elegir la salida activations = sigmoid(logits)
@@ -403,6 +406,24 @@ def process_file(audio_path: Path, args: argparse.Namespace):
         tempo_json = temp_dir / f"{base_name}_tempo.json"
         if run_subprocess([str(tempocnn_exe), str(audio_path), str(tempo_json), str(tempocnn_model)]):
             json_results["tempo"] = tempo_json
+
+    print(f"  -> Evaluando modelos MusiCNN...")
+    musicnn_exe = essentia_dir / "streaming_musicnn_predict.exe"
+    musicnn_dir = essentia_dir / "models" / "musicnn"
+    if musicnn_exe.exists() and musicnn_dir.exists():
+        for pb_file in musicnn_dir.glob("*.pb"):
+            out_json = temp_dir / f"{base_name}_{pb_file.stem}.json"
+            if run_subprocess([str(musicnn_exe), str(audio_path), str(out_json), str(pb_file)]):
+                json_results[pb_file.stem] = out_json
+            
+    print(f"  -> Evaluando modelos VGGish...")
+    vggish_exe = essentia_dir / "streaming_vggish_predict.exe"
+    vggish_dir = essentia_dir / "models" / "vggish"
+    if vggish_exe.exists() and vggish_dir.exists():
+        for pb_file in vggish_dir.glob("*.pb"):
+            out_json = temp_dir / f"{base_name}_{pb_file.stem}.json"
+            if run_subprocess([str(vggish_exe), str(audio_path), str(out_json), str(pb_file)]):
+                json_results[pb_file.stem] = out_json
     
     print(f"  -> Evaluando EffNet track embeddings (ONNX)...")
 
