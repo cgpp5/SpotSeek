@@ -6,12 +6,52 @@ import json
 import shutil
 import subprocess
 import tempfile
+import time
+import hashlib
 import numpy as np
 import librosa
 import onnxruntime as ort
 from pathlib import Path
 
 AUDIO_EXTENSIONS = {".mp3", ".flac", ".m4a", ".wav", ".ogg", ".aac", ".wma", ".opus", ".aiff", ".aif", ".wv"}
+
+def file_hash(path: Path) -> str:
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def track_key(artist: str, title: str, album: str | None) -> str:
+    album = album or ""
+    return f"{artist}|{title}|{album}".lower()
+
+def append_pending_redownload(redownload_dir: Path, artist: str, title: str, album: str):
+    csv_path = redownload_dir / "pending_redownload.csv"
+    exists = csv_path.exists()
+
+    with open(csv_path, "a", encoding="utf-8", newline="") as f:
+        if not exists:
+            f.write("Artist Name,Track Name,Album\n")
+        f.write(f"{artist},{title},{album}\n")
+
+def remove_from_pending_redownload(redownload_dir: Path, artist: str, title: str, album: str):
+    csv_path = redownload_dir / "pending_redownload.csv"
+    if not csv_path.exists():
+        return
+
+    with open(csv_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    header = lines[0]
+    remaining = [
+        line for line in lines[1:]
+        if line.strip() != f"{artist},{title},{album}"
+    ]
+
+    with open(csv_path, "w", encoding="utf-8") as f:
+        f.write(header)
+        f.writelines(remaining)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Análisis avanzado con Essentia (TensorFlow + SVM).")
@@ -64,19 +104,22 @@ def run_subprocess(cmd: list[str]) -> bool:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             env=env
         )
 
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-
-        # Forzar afinidad inmediatamente
-        if not kernel32.SetProcessAffinityMask(proc._handle, P_CORE_MASK):
-            raise ctypes.WinError(ctypes.get_last_error())
+        # Intentar fijar afinidad (optimización, NO crítica)
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.SetProcessAffinityMask(proc._handle, P_CORE_MASK)
+        except Exception as e:
+            print(f"  -> Aviso: no se pudo fijar afinidad: {e}")
 
         stdout, stderr = proc.communicate()
 
         if proc.returncode != 0:
-            print(f"Fallo en: {Path(cmd[0]).name} con el modelo {Path(cmd[3]).name}")
+            print(f"Fallo en: {Path(cmd[0]).name}")
             if stdout.strip():
                 print(f"  -> STDOUT: {stdout.strip()}")
             if stderr.strip():
@@ -86,7 +129,7 @@ def run_subprocess(cmd: list[str]) -> bool:
         return True
 
     except Exception as e:
-        print(f"Excepción crítica:\n{e}")
+        print(f"Excepción crítica en subprocess:\n{e}")
         return False
 
 def merge_jsons(json_results: dict[str, Path], output_path: Path, semantic_data: dict | None = None):
@@ -379,14 +422,18 @@ def map_maest_labels(scores, classes):
         "subgenres": sorted(set(styles)),
     }
 
-def process_file(audio_path: Path, args: argparse.Namespace):
+def process_file(audio_path: Path, args: argparse.Namespace, failed_variants: dict):
     essentia_dir = Path(args.essentia_dir)
     temp_dir = Path(tempfile.gettempdir()) / "spotseek_analysis"
     temp_dir.mkdir(parents=True, exist_ok=True)
+    redownload_dir = Path(args.input_dir).parent / "pending_redownload"
+    redownload_dir.mkdir(exist_ok=True)
+
     
     base_name = audio_path.stem
     json_results: dict[str, Path] = {}
     semantic_data = {}
+    onnx_failed = False
     
     print(f"  -> Extrayendo características base y SVM...")
     extractor_exe = essentia_dir / "streaming_extractor_music.exe"
@@ -415,8 +462,12 @@ def process_file(audio_path: Path, args: argparse.Namespace):
             run_effnet_track_embeddings(audio_path, effnet_model, effnet_meta, effnet_out)
             json_results["effnet_track"] = effnet_out
         except Exception as e:
-            print(f"    Fallo EffNet ONNX: {e}")
-
+            print(f"    Fallo EffNet ONNX: {repr(e)}")
+            onnx_failed = True
+    else:
+        print("    Fallo EffNet ONNX: modelo o meta no existe")
+        onnx_failed = True
+        
     print(f"  -> Evaluando OpenL3 music embeddings (ONNX)...")
 
     openl3_model = essentia_dir / "models" / "openl3-music-mel256-emb512-3.onnx"
@@ -428,8 +479,12 @@ def process_file(audio_path: Path, args: argparse.Namespace):
             run_openl3_embeddings(audio_path, openl3_model, openl3_meta, openl3_out)
             json_results["openl3_music"] = openl3_out
         except Exception as e:
-            print(f"    Fallo OpenL3 ONNX: {e}")
-
+            print(f"    Fallo OpenL3 ONNX: {repr(e)}")
+            onnx_failed = True
+    else:
+        print("    Fallo OpenL3 ONNX: modelo o meta no existe")
+        onnx_failed = True
+        
     print(f"  -> Evaluando MAEST 30s 519L (ONNX)...")
 
     maest_model = essentia_dir / "models" / "discogs-maest-30s-pw-519l-2.onnx"
@@ -441,7 +496,51 @@ def process_file(audio_path: Path, args: argparse.Namespace):
             run_maest_30s_519(audio_path, maest_model, maest_meta, maest_out)
             json_results["maest_519"] = maest_out
         except Exception as e:
-            print(f"    Fallo MAEST ONNX: {e}")
+            print(f"    Fallo MAEST ONNX: {repr(e)}")
+            onnx_failed = True
+    else:
+        print("    Fallo MAEST ONNX: modelo o meta no existe")
+        onnx_failed = True
+    
+    if onnx_failed:
+        artist = audio_path.parent.name
+        title = audio_path.stem
+        album = ""
+        
+        key = track_key(artist, title, album)
+        
+        h = file_hash(audio_path)
+
+        entry = failed_variants.setdefault(key, {"hashes": {}})
+
+        # Si este binario ya fue probado, no hacemos nada nuevo
+        if h in entry["hashes"]:
+            print(f"  -> Variante ya probada, se descarta: {audio_path.name}")
+            from send2trash import send2trash
+            send2trash(audio_path)
+            return
+
+        # Variante nueva: registrar hash
+        entry["hashes"][h] = int(time.time())
+
+        # Persistir inmediatamente el estado
+        failed_variants_path = redownload_dir / "failed_variants.json"
+        with open(failed_variants_path, "w", encoding="utf-8") as f:
+            json.dump(failed_variants, f, indent=2)
+
+        # Añadir a pending_redownload.csv
+        append_pending_redownload(
+            Path(args.input_dir),
+            artist,
+            title,
+            album
+        )
+
+        print(f"  -> Añadido a pending_redownload: {artist} - {title}")
+
+        from send2trash import send2trash
+        send2trash(audio_path)
+        return
 
     with open(maest_meta, "r", encoding="utf-8") as f:
         maest_info = json.load(f)
@@ -458,6 +557,27 @@ def process_file(audio_path: Path, args: argparse.Namespace):
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     
+    artist = audio_path.parent.name
+    title = audio_path.stem
+    album = ""
+
+    key = track_key(artist, title, album)
+
+    # --- LIMPIEZA DE ESTADO AL ÉXITO ---
+    if key in failed_variants:
+        del failed_variants[key]
+
+        failed_variants_path = redownload_dir / "failed_variants.json"
+        with open(failed_variants_path, "w", encoding="utf-8") as f:
+            json.dump(failed_variants, f, indent=2)
+
+        remove_from_pending_redownload(
+            Path(args.input_dir),
+            artist,
+            title,
+            album
+        )
+    
     shutil.move(str(merged_json_path), str(out_dir / f"{base_name}.json"))
     shutil.move(str(audio_path), str(out_dir / audio_path.name))
     
@@ -470,18 +590,49 @@ def process_file(audio_path: Path, args: argparse.Namespace):
 def main():
     args = parse_args()
     input_dir = Path(args.input_dir)
-    
+
     if not input_dir.exists():
         print(f"El directorio {input_dir} no existe.")
         return
 
-    pending_files = [p for p in input_dir.rglob("*") if p.suffix.lower() in AUDIO_EXTENSIONS]
+    # ------------------------------------------------------------
+    # Registro persistente de variantes fallidas (en pending/)
+    # ------------------------------------------------------------
+    redownload_dir = input_dir.parent / "pending_redownload"
+    redownload_dir.mkdir(exist_ok=True)
+    failed_variants_path = redownload_dir / "failed_variants.json"
+
+    if failed_variants_path.exists():
+        try:
+            with open(failed_variants_path, "r", encoding="utf-8") as f:
+                failed_variants = json.load(f)
+        except Exception:
+            failed_variants = {}
+    else:
+        failed_variants = {}
+
+    pending_files = [
+        p for p in input_dir.rglob("*")
+        if p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS
+    ]
+
     print(f"Encontrados {len(pending_files)} archivos pendientes en {input_dir}")
-    
+
     for audio_file in pending_files:
         print(f"\nProcesando: {audio_file.name}")
-        process_file(audio_file, args)
-        
+        try:
+            process_file(audio_file, args, failed_variants)
+        except Exception as e:
+            print(f"ERROR procesando {audio_file.name}: {e}")
+            # No abortar el pipeline completo; seguimos con el siguiente
+            continue
+
+    # ------------------------------------------------------------
+    # Persistir estado actualizado (limpio automáticamente)
+    # ------------------------------------------------------------
+    with open(failed_variants_path, "w", encoding="utf-8") as f:
+        json.dump(failed_variants, f, indent=2)
+
     print("\nPipeline finalizado.")
 
 if __name__ == "__main__":

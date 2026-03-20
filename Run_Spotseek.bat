@@ -47,6 +47,37 @@ if errorlevel 1 (
 )
 
 REM ------------------------------------------------------------------
+REM Re-download failed tracks if pending_redownload.csv exists
+REM ------------------------------------------------------------------
+set "REDOWNLOAD_DIR=C:\Program Files\SpotSeek\pending_redownload"
+set "REDOWNLOAD_CSV=%REDOWNLOAD_DIR%\pending_redownload.csv"
+
+if exist "%REDOWNLOAD_CSV%" (
+    for %%A in ("%REDOWNLOAD_CSV%") do (
+        REM Skip if CSV only contains header
+        if %%~zA GTR 40 (
+            echo Starting intelligent re-download of failed tracks...
+
+            %PYTHON_CMD% "C:\Program Files\SpotSeek\tools\run_redownload.py" ^
+                --csv "%REDOWNLOAD_CSV%" ^
+                --pending-dir "%REDOWNLOAD_DIR%" ^
+                --sldl "C:\Program Files\SpotSeek\soulseek\sldl.exe" ^
+                --user %SOULSEEK_USER% ^
+                --pass %SOULSEEK_PASS% ^
+                --path "C:\Program Files\SpotSeek" ^
+                --format flac,aac,m4a,mp3 ^
+                --pref-format flac,aac,m4a,mp3 ^
+                --min-bitrate 320 ^
+                --concurrent-downloads 6 ^
+                --skip-not-found ^
+                --desperate ^
+                --artist-maybe-wrong ^
+                --on-complete-script "C:\Program Files\SpotSeek\tools\register_failed_user.py"
+        )
+    )
+)
+
+REM ------------------------------------------------------------------
 REM Execute Essentia analysis pipeline
 REM ------------------------------------------------------------------
 if "%SPOTSEEK_PENDING_DIR%"=="" set "SPOTSEEK_PENDING_DIR=C:\Program Files\SpotSeek\pending"

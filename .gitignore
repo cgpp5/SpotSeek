@@ -1,6 +1,7 @@
 # Environment variables
 credentials.env
 pending/
+pending_redownload/
 essentia/
 venv/
 
